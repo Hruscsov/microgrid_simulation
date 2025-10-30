@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pandapower as pp
+import matplotlib.pyplot as plt
 
 # --- 1. Adatok beolvasása ---
 file_path = "C:\\Users\\gytom\\szakgyak\\Berkenye_modell.xlsx"
@@ -58,6 +59,8 @@ for _, row in links.iterrows():
         pp.create_load(net, bus=t, p_mw=0.01, q_mvar=0.005,
                        name=f"Load_{row['TO_ELEM']}")
 
+# --- 5. Buszok geometriája (koordináták) ---
+
 geodata = df[["FROM_ELEM", "XCOORD", "YCOORD"]].drop_duplicates(subset=["FROM_ELEM"])
 
 net.bus_geodata = pd.DataFrame(columns=["x", "y"])
@@ -67,9 +70,30 @@ for _, row in geodata.iterrows():
         bus_idx = net.bus.index[net.bus.name == bus_name][0]
         net.bus_geodata.loc[bus_idx, ["x", "y"]] = [row["XCOORD"], row["YCOORD"]]
 
-# --- 6. Eredmény kiírása ---
+# --- 🔧 Koordináták skálázása és ellenőrzése ---
+# A koordináták gyakran nagyon eltérő tartományban vannak, ezért normalizáljuk őket
+x = (geodata["XCOORD"] - geodata["XCOORD"].min()) / (geodata["XCOORD"].max() - geodata["XCOORD"].min())
+y = (geodata["YCOORD"] - geodata["YCOORD"].min()) / (geodata["YCOORD"].max() - geodata["YCOORD"].min())
+
+# A net.bus_geodata táblát kitöltjük normalizált értékekkel
+net.bus_geodata["x"] = x.values[:len(net.bus_geodata)]
+net.bus_geodata["y"] = y.values[:len(net.bus_geodata)]
+
+# --- Gyors ellenőrző ábra ---
+plt.figure(figsize=(10, 10))
+plt.scatter(net.bus_geodata["x"], net.bus_geodata["y"], s=10, color="blue")
+plt.gca().invert_yaxis()
+plt.title("Normalizált hálózati csomópontok")
+plt.xlabel("x (relatív)")
+plt.ylabel("y (relatív)")
+plt.show()
+
+# --- 6. Hálózat exportálása és vizualizálása ---
 print(net)
 pp.to_json(net, "berkenye_network.json")
+
+# régebbi pandapower verziókban NINCS use_bus_geodata paraméter!
 pp.plotting.simple_plot(net)
 
 print("✅ Hálózat létrehozva és elmentve: berkenye_network.json")
+
