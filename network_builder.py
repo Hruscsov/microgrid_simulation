@@ -1,13 +1,23 @@
 import json
 from os.path import exists
 
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import numpy as np
 import pandapower as pp
-import pandapower.plotting as plot
 import pandas as pd
 
+from visualization import plot_loadflow_results
+
+def create_load_or_pv(net, bus, p_mw, q_mvar, name):
+    """
+    Létrehoz egy terhelést vagy napelemet a megadott buszon.
+    A név alapján dönt, hogy melyiket hozza létre.
+    """
+    name = str(name).upper()
+    p_mw = abs(p_mw)
+    q_mvar = abs(q_mvar)
+    if "HMKE" in name:
+        pp.create_sgen(net, bus=bus, p_mw=-p_mw, q_mvar=-q_mvar, name=name)
+    else:
+        pp.create_load(net, bus=bus, p_mw=p_mw, q_mvar=q_mvar, name=name)
 
 def ensure_bus_geodata_from_column(net):
     """
@@ -38,90 +48,6 @@ def ensure_bus_geodata_from_column(net):
         net.bus_geodata = pd.DataFrame(rows).set_index("bus")
 
 
-def plot_loadflow_results(net):
-    # --- 1) buszfeszültség színezés ---
-    vm = net.res_bus.vm_pu.values  # p.u.
-    vmin, vmax = 0.95, 1.05
-    vm_clipped = np.clip(vm, vmin, vmax)
-    vm_norm = (vm_clipped - vmin) / (vmax - vmin + 1e-9)
-    bus_colors = [plt.cm.viridis(val) for val in vm_norm]
-
-    bus_collection = plot.create_bus_collection(
-        net,
-        buses=net.bus.index.tolist(),
-        size=20,
-        color=bus_colors
-    )
-
-    # --- 2) vonalterhelés színezés ---
-    line_collections = []
-    line_colors = None
-    if len(net.line):
-        loading = net.res_line.loading_percent.values  # %
-        loading_clipped = np.clip(loading, 0, 100)
-        loading_norm = loading_clipped / 100.0
-        line_colors = [plt.cm.inferno(val) for val in loading_norm]
-
-        lc = plot.create_line_collection(
-            net,
-            lines=net.line.index.tolist(),
-            use_bus_geodata=True,
-            color=line_colors,
-            linewidths=2
-        )
-        line_collections.append(lc)
-
-    # --- 3) kirajzolás ---
-    ax = plot.draw_collections(
-        [bus_collection] + line_collections,
-        figsize=(10, 8)
-    )
-    ax.set_title("Berkenye – busz feszültség (szín) és vonalterhelés (szín)")
-
-    # --- 4) BUSZ FELIRATOK ---
-    # csak azokhoz tudunk írni, amiknek van geodata-ja
-    if hasattr(net, "bus_geodata") and not net.bus_geodata.empty:
-        for bus_idx in net.bus.index:
-            if bus_idx in net.bus_geodata.index:
-                x = net.bus_geodata.at[bus_idx, "x"]
-                y = net.bus_geodata.at[bus_idx, "y"]
-                vm_pu = net.res_bus.at[bus_idx, "vm_pu"]
-                # a busz neve alapból a net.bus.name-ben van
-                bus_name = net.bus.at[bus_idx, "name"]
-                ax.text(
-                    x,
-                    y + 0.08,  # kicsit fölé
-                    f"{bus_name} / {vm_pu:.3f} pu",
-                    fontsize=6,
-                    ha="center",
-                    va="bottom",
-                )
-
-    # --- 5) SZÍNSKÁLÁK (colorbar) ---
-
-    # busz feszültség skála
-    sm_bus = mpl.cm.ScalarMappable(
-        cmap=plt.cm.viridis,
-        norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax)
-    )
-    sm_bus.set_array([])
-    cbar_bus = plt.colorbar(sm_bus, ax=ax, fraction=0.03, pad=0.01)
-    cbar_bus.set_label("Bus voltage [p.u.]", fontsize=8)
-
-    # vonalterhelés skála (ha van line)
-    if len(net.line):
-        sm_line = mpl.cm.ScalarMappable(
-            cmap=plt.cm.inferno,
-            norm=mpl.colors.Normalize(vmin=0, vmax=100)
-        )
-        sm_line.set_array([])
-        cbar_line = plt.colorbar(sm_line, ax=ax, fraction=0.03, pad=0.06)
-        cbar_line.set_label("Line loading [%]", fontsize=8)
-
-    plt.tight_layout()
-    plt.show()
-
-
 def build_network(read_from_file=False):
     network_dump = "network_dump/network.p"
     if read_from_file and exists(network_dump):
@@ -129,7 +55,7 @@ def build_network(read_from_file=False):
         return pp.from_pickle(network_dump)
 
     # --- 1. Adatok beolvasása ---
-    file_path = r"C:\Users\gytom\szakgyak\Berkenye_modell.xlsx"
+    file_path = r"Berkenye_modell.xlsx"
 
     # Topology a hálózat logikájához
     topo = pd.read_excel(file_path, sheet_name="Topology")
@@ -140,6 +66,18 @@ def build_network(read_from_file=False):
 
     gdata_links = pd.read_excel(file_path, sheet_name="Graphic_links")
     gdata_links = gdata_links.set_index("NEPID")
+
+    loads = pd.read_excel(file_path, sheet_name="Load")
+    loads = loads.set_index("NEPID")
+
+    lineloads = pd.read_excel(file_path, sheet_name="Lineload")
+    lineloads = lineloads.set_index("NEPID")
+
+    lines = pd.read_excel(file_path, sheet_name="Line")
+    lines = lines.set_index("NEPID")
+
+    trafo = pd.read_excel(file_path, sheet_name="Trafo")
+    trafo = trafo.set_index("NEPID")
 
     # --- 2. Üres hálózat ---
     net = pp.create_empty_network(sn_mva=0.4)
@@ -203,17 +141,25 @@ def build_network(read_from_file=False):
             if n1 is not None:
                 pp.create_ext_grid(net, bus=n1, vm_pu=1.0, name=f"FEEDER_{name}")
 
+        # TODO: vezetékek paraméterezése a táblázat alapján
         elif etype == "LINE":
             if (n1 is not None) and (n2 is not None):
+                params = lines.loc[int(row["NEPID"])]
                 pp.create_line_from_parameters(
                     net,
                     from_bus=n1,
                     to_bus=n2,
-                    length_km=0.1,
-                    r_ohm_per_km=0.642,
-                    x_ohm_per_km=0.083,
-                    c_nf_per_km=210,
-                    max_i_ka=0.1,
+                    length_km=params["LENGTH"],
+                    r_ohm_per_km=params["R1"],
+                    x_ohm_per_km=params["X1"],
+                    c_nf_per_km=params["C1"]*1000,  # csak ha C1 µF/km! (ha már nF/km, akkor ne szorozz)
+                    max_i_ka=params["IRMAX"]/1000,
+                    type="cs" if params["CABLE"] == 1 else "ol",
+                    parallel=int(params["NUMPARALLEL"]) if not pd.isna(params["NUMPARALLEL"]) else 1,
+                    # opcionális, ha a pandapower verziód támogatja:
+                    r0_ohm_per_km=params["R0"],
+                    x0_ohm_per_km=params["X0"],
+                    c0_nf_per_km=params["C0"] * 1000,  # ugyanaz az egységlogika, mint C1-nél
                     name=f"LINE_{name}_{row['NODE1']}_{row['NODE2']}"
                 )
 
@@ -231,31 +177,33 @@ def build_network(read_from_file=False):
 
         elif etype == "TRANSFORMER":
             if (n1 is not None) and (n2 is not None):
+                params = trafo.loc[int(row["NEPID"])]
                 pp.create_transformer_from_parameters(
                     net,
                     hv_bus=n1,
                     lv_bus=n2,
-                    sn_mva=0.4,
-                    vn_hv_kv=20.0,
-                    vn_lv_kv=0.4,
-                    vk_percent=4,
-                    vkr_percent=1,
-                    pfe_kw=1,
-                    i0_percent=0.1,
-                    name=f"TR_{name}_{row['NODE1']}_{row['NODE2']}"
+                    sn_mva=params["SR"],
+                    vn_hv_kv=params["UR1"],
+                    vn_lv_kv=params["UR2"],
+                    vk_percent=params["UKR"],
+                    vkr_percent=params["URR"],
+                    pfe_kw=params["PFE"],
+                    i0_percent=params["I0"] if not pd.isna(params["I0"]) else 0.0,
+                    name=f"TR_{params['NAME']}_{row['NODE1']}_{row['NODE2']}"
                 )
 
         elif etype == "LOAD":
             if n1 is None:
                 print(name, row["NODE1"])
             else:
-                pp.create_load(net, bus=n1, p_mw=0.01, q_mvar=0.005, name=f"LOAD_{name}")
-
+                params = loads.loc[int(row["NEPID"])]
+                create_load_or_pv(net, n1, p_mw=params['P']/1000, q_mvar=params['Q']/1000, name=name)
         elif etype == "LINE-LOAD":
             if n1 is None:
                 print(name, row["NODE1"])
             else:
-                pp.create_load(net, bus=n1, p_mw=0.005, q_mvar=0.002, name=f"LL_{name}")
+                params = lineloads.loc[int(row["NEPID"])]
+                create_load_or_pv(net, n1, p_mw=params['P']/1000, q_mvar=params['Q']/1000, name=name)
 
         else:
             print("Nem kezelt típus")
