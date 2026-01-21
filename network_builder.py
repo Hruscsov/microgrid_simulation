@@ -3,8 +3,84 @@ from os.path import exists
 
 import pandapower as pp
 import pandas as pd
-
 from visualization import plot_loadflow_results
+
+
+def _consolidate_bus_geodata(net):
+    """Ensure `net.bus_geodata` exists and contains x,y for buses when possible.
+    This function looks for geodata in several places that `create_bus` or the
+    builder might have stored it:
+      - net.bus_geodata (preferred)
+      - net.bus['geodata'] (may be dict, list/tuple or JSON string)
+      - net.bus['x'] and net.bus['y'] columns
+    If enough positions are found, net.bus_geodata is created/overwritten with
+    a DataFrame indexed by bus and columns x,y.
+    """
+    pos = {}
+
+    # 1) existing net.bus_geodata
+    if hasattr(net, "bus_geodata") and getattr(net, "bus_geodata") is not None and not net.bus_geodata.empty:
+        try:
+            for bus_idx in net.bus_geodata.index:
+                x = net.bus_geodata.at[bus_idx, "x"]
+                y = net.bus_geodata.at[bus_idx, "y"]
+                if pd.notna(x) and pd.notna(y):
+                    pos[bus_idx] = (float(x), float(y))
+        except Exception:
+            # if the structure is unexpected, ignore and continue with other sources
+            pos = {}
+
+    # 2) geodata column on net.bus
+    if not pos and "geodata" in net.bus.columns:
+        for bus_idx, row in net.bus.iterrows():
+            gd = row.get("geodata")
+            if pd.isna(gd):
+                continue
+            # list or tuple
+            if isinstance(gd, (list, tuple)) and len(gd) >= 2:
+                try:
+                    pos[bus_idx] = (float(gd[0]), float(gd[1]))
+                    continue
+                except Exception:
+                    pass
+            # dict with x,y
+            if isinstance(gd, dict) and "x" in gd and "y" in gd:
+                try:
+                    pos[bus_idx] = (float(gd["x"]), float(gd["y"]))
+                    continue
+                except Exception:
+                    pass
+            # json string
+            if isinstance(gd, str):
+                try:
+                    parsed = json.loads(gd)
+                    if isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+                        pos[bus_idx] = (float(parsed[0]), float(parsed[1]))
+                        continue
+                    if isinstance(parsed, dict) and "x" in parsed and "y" in parsed:
+                        pos[bus_idx] = (float(parsed["x"]), float(parsed["y"]))
+                        continue
+                except Exception:
+                    pass
+
+    # 3) separate x and y columns on net.bus
+    if not pos and "x" in net.bus.columns and "y" in net.bus.columns:
+        for bus_idx, row in net.bus.iterrows():
+            xval = row.get("x")
+            yval = row.get("y")
+            if pd.notna(xval) and pd.notna(yval):
+                try:
+                    pos[bus_idx] = (float(xval), float(yval))
+                except Exception:
+                    pass
+
+    # write net.bus_geodata if we found anything
+    if pos:
+        df = pd.DataFrame([{"bus": int(b), "x": xy[0], "y": xy[1]} for b, xy in pos.items()]).set_index("bus")
+        net.bus_geodata = df
+        return True
+    return False
+
 
 def create_load_or_pv(net, bus, p_mw, q_mvar, name):
     """
@@ -15,9 +91,11 @@ def create_load_or_pv(net, bus, p_mw, q_mvar, name):
     p_mw = abs(p_mw)
     q_mvar = abs(q_mvar)
     if "HMKE" in name:
-        pp.create_sgen(net, bus=bus, p_mw=-p_mw, q_mvar=-q_mvar, name=name)
+        idx = pp.create_sgen(net, bus=bus, p_mw=p_mw, q_mvar=q_mvar, name=name)
+        net.sgen.loc[idx, ["p_mw0", "p_qmvar0"]] = p_mw, q_mvar
     else:
-        pp.create_load(net, bus=bus, p_mw=p_mw, q_mvar=q_mvar, name=name)
+        idx = pp.create_load(net, bus=bus, p_mw=p_mw, q_mvar=q_mvar, name=name)
+        net.load.loc[idx, ["p_mw0", "p_qmvar0"]] = p_mw, q_mvar
 
 def ensure_bus_geodata_from_column(net):
     """
@@ -46,6 +124,121 @@ def ensure_bus_geodata_from_column(net):
     # TODO: kidebuggolni, hogy miért nincs  buszoknak geocoordinátája
     if rows:
         net.bus_geodata = pd.DataFrame(rows).set_index("bus")
+
+
+def _merge_switch_connected_buses(net):
+    """Merge bus pairs that are connected only via a single bus-bus switch.
+    For each bus-bus switch (et=='b'), if there are no other lines/trasformers/switches
+    between the two buses, reassign all elements from one bus to the other and
+    remove the redundant bus and the switch.
+    This function mutates `net` in-place.
+    """
+    # helper to detect other connections besides a particular switch
+    def has_other_connection(b1, b2, sw_idx):
+        # lines
+        if hasattr(net, "line") and len(net.line):
+            cond = ((net.line['from_bus'] == b1) & (net.line['to_bus'] == b2)) | ((net.line['from_bus'] == b2) & (net.line['to_bus'] == b1))
+            if cond.any():
+                return True
+        # trafos
+        if hasattr(net, "trafo") and len(net.trafo):
+            cond = ((net.trafo['hv_bus'] == b1) & (net.trafo['lv_bus'] == b2)) | ((net.trafo['hv_bus'] == b2) & (net.trafo['lv_bus'] == b1))
+            if cond.any():
+                return True
+        # other switches connecting same pair (exclude the current)
+        if hasattr(net, "switch") and len(net.switch):
+            sws = net.switch
+            cond = (sws['et'] == 'b') & (((sws['bus'] == b1) & (sws['element'] == b2)) | ((sws['bus'] == b2) & (sws['element'] == b1)))
+            if cond.any():
+                # if more than one such switch or the only one is not the current, treat as other connection
+                matches = sws[cond]
+                if len(matches) > 1:
+                    return True
+                if sw_idx not in matches.index:
+                    return True
+        return False
+
+    def reassign_bus(from_bus, to_bus):
+        # update common element tables with a 'bus' column
+        tables_with_bus = ['load', 'sgen', 'storage', 'ext_grid', 'gen', 'shunt', 'ward', 'xward']
+        for tab in tables_with_bus:
+            if hasattr(net, tab) and len(getattr(net, tab)):
+                df = getattr(net, tab)
+                if 'bus' in df.columns:
+                    df.loc[df['bus'] == from_bus, 'bus'] = to_bus
+        # update lines
+        if hasattr(net, 'line') and len(net.line):
+            net.line.loc[net.line['from_bus'] == from_bus, 'from_bus'] = to_bus
+            net.line.loc[net.line['to_bus'] == from_bus, 'to_bus'] = to_bus
+        # update trafos
+        if hasattr(net, 'trafo') and len(net.trafo):
+            net.trafo.loc[net.trafo['hv_bus'] == from_bus, 'hv_bus'] = to_bus
+            net.trafo.loc[net.trafo['lv_bus'] == from_bus, 'lv_bus'] = to_bus
+        # update switches
+        if hasattr(net, 'switch') and len(net.switch):
+            sw = net.switch
+            # bus column
+            if 'bus' in sw.columns:
+                sw.loc[sw['bus'] == from_bus, 'bus'] = to_bus
+            # element when et=='b'
+            mask = (sw['et'] == 'b') & (sw['element'] == from_bus)
+            if mask.any():
+                sw.loc[mask, 'element'] = to_bus
+        # update bus_geodata
+        if hasattr(net, 'bus_geodata') and getattr(net, 'bus_geodata') is not None and not net.bus_geodata.empty:
+            if from_bus in net.bus_geodata.index:
+                if to_bus not in net.bus_geodata.index:
+                    # move geodata
+                    net.bus_geodata.loc[to_bus] = net.bus_geodata.loc[from_bus]
+                # drop the from_bus row
+                try:
+                    net.bus_geodata = net.bus_geodata.drop(index=from_bus)
+                except Exception:
+                    pass
+        # finally drop the bus from net.bus
+        if from_bus in net.bus.index:
+            try:
+                net.bus = net.bus.drop(index=from_bus)
+            except Exception:
+                pass
+
+    # loop until no more merges can be done
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        if not (hasattr(net, 'switch') and len(net.switch)):
+            break
+        # iterate over a snapshot of switches
+        for sw_idx, sw in list(net.switch.iterrows()):
+            try:
+                if sw.et != 'b':
+                    continue
+            except Exception:
+                continue
+            b1 = int(sw['bus'])
+            b2 = int(sw['element'])
+            if has_other_connection(b1, b2, sw_idx):
+                continue
+            # choose keep bus: prefer ext_grid bus, otherwise smaller idx
+            keep = None
+            if hasattr(net, 'ext_grid') and len(net.ext_grid) and (net.ext_grid['bus'] == b1).any():
+                keep = b1
+            elif hasattr(net, 'ext_grid') and len(net.ext_grid) and (net.ext_grid['bus'] == b2).any():
+                keep = b2
+            else:
+                keep = min(b1, b2)
+            remove = b2 if keep == b1 else b1
+
+            # reassign everything from 'remove' to 'keep'
+            reassign_bus(remove, keep)
+            # remove the switch that connected them
+            try:
+                net.switch = net.switch.drop(index=sw_idx)
+            except Exception:
+                pass
+            merged_any = True
+            # restart scanning after a merge
+            break
 
 
 def build_network(read_from_file=False):
@@ -105,17 +298,29 @@ def build_network(read_from_file=False):
     # --- 4. Buszok létrehozása ---
     bus_map = {}
     medium_voltage_buses = bus_rows.loc[bus_rows.NAME.str.contains("KÖF")].NEPID.astype(int).values
+    bus_geo_rows = []
     for nid in sorted(all_nodes):
         nid = int(nid)
-        geodata = tuple()
+        # geodata should be None or a (x,y) tuple of floats; avoid empty tuple
+        geodata = None
         if nid in gdata.index:
-            geodata = tuple(gdata.loc[int(nid), ["XPOS", "YPOS"]])
+            xpos, ypos = gdata.loc[int(nid), ["XPOS", "YPOS"]]
+            geodata = (float(xpos), float(ypos))
         elif nid in gdata_links.index:
-            geodata = tuple(gdata_links.loc[int(nid), ["XCOORD", "YCOORD"]].iloc[0])
+            xcoord, ycoord = gdata_links.loc[int(nid), ["XCOORD", "YCOORD"]].iloc[0]
+            geodata = (float(xcoord), float(ycoord))
 
         voltage = 20 if nid in medium_voltage_buses else 0.4
-        bus_idx = pp.create_bus(net, vn_kv=voltage, name=nid, geodata=geodata)
+        # name should be a string (pandapower hints expect str), keep original nid as label
+        bus_idx = pp.create_bus(net, vn_kv=voltage, name=str(nid), geodata=geodata)
+        # store geodata for later consolidation (use pandapower bus index)
+        if geodata is not None:
+            bus_geo_rows.append({"bus": int(bus_idx), "x": geodata[0], "y": geodata[1]})
         bus_map[nid] = bus_idx
+
+    # if we collected geodata while creating buses, set net.bus_geodata now
+    if bus_geo_rows:
+        net.bus_geodata = pd.DataFrame(bus_geo_rows).set_index("bus")
 
     def get_bus(node_val):
         if pd.isna(node_val):
@@ -141,7 +346,6 @@ def build_network(read_from_file=False):
             if n1 is not None:
                 pp.create_ext_grid(net, bus=n1, vm_pu=1.0, name=f"FEEDER_{name}")
 
-        # TODO: vezetékek paraméterezése a táblázat alapján
         elif etype == "LINE":
             if (n1 is not None) and (n2 is not None):
                 params = lines.loc[int(row["NEPID"])]
@@ -210,7 +414,24 @@ def build_network(read_from_file=False):
             pass
 
     print(net)
-    ensure_bus_geodata_from_column(net)
+    # try to consolidate any geodata from different sources into net.bus_geodata
+    try:
+        _consolidate_bus_geodata(net)
+    except Exception:
+        pass
+    # additional conversion from 'geo' column if present
+    try:
+        ensure_bus_geodata_from_column(net)
+    except Exception:
+        pass
+    # merge bus pairs that are only connected by a single switch
+    try:
+        _merge_switch_connected_buses(net)
+    except Exception:
+        pass
+    # Akkumulátor
+    pp.create_storage(net, 0, p_mw=0.0, max_e_mwh=0.05,
+                      soc_percent=50, min_e_mwh=0.01, max_p_mw=0.03, min_p_mw=-0.03)
     pp.to_pickle(net, network_dump)
     return net
 
