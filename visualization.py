@@ -65,7 +65,7 @@ def visualize_network(net, k=None, iterations=50, figsize=(10, 8)):
     plt.show()
 
 
-def plot_loadflow_results(net):
+def plot_loadflow_results(net, net_name):
     # --- 1) buszfeszültség színezés ---
     vm = net.res_bus.vm_pu.values  # p.u.
     vmin, vmax = 0.95, 1.05
@@ -165,7 +165,7 @@ def plot_loadflow_results(net):
             vm_pu = net.res_bus.at[bus_idx, "vm_pu"]
             bus_name = net.bus.at[bus_idx, "name"] if "name" in net.bus.columns else ""
             if bus_name:
-                label = f"{bus_name} ({bus_idx}) / {vm_pu:.3f} pu"
+                label = f"{bus_idx}----------------->"
             else:
                 label = f"{bus_idx} / {vm_pu:.3f} pu"
             # small offset so the text does not overlap the marker
@@ -201,6 +201,10 @@ def plot_loadflow_results(net):
                     st_ys.append(yy)
         if st_xs:
             ax.scatter(st_xs, st_ys, c="orange", marker="s", s=120, edgecolors="k", zorder=6, label="Storage")
+
+        # LOADokra ugyanez
+        # Kiplott load markereket is
+        # Feliratot hogyan kell a load mellé tenni az ábrán? Csak a loadok id-jére vagyunk kíváncsiak.
 
         # Add a small legend for the additional markers
         handles, labels = ax.get_legend_handles_labels()
@@ -248,6 +252,6 @@ def plot_loadflow_results(net):
         cbar_line.set_label("Line loading [%]", fontsize=9)
         cbar_line.ax.tick_params(labelsize=9)
     plt.tight_layout(rect=(0, 0, 0.85, 1))  # leave space on the right for colorbars
-    plt.savefig("loadflow_results.png", dpi=300)
+    plt.savefig(f"loadflow_results_{net_name}.png", dpi=300)
     plt.show()
     plt.close()

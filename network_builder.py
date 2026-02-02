@@ -4,7 +4,8 @@ from os.path import exists
 import pandapower as pp
 import pandas as pd
 from visualization import plot_loadflow_results
-
+import pandapower.topology as ppt
+import networkx as nx
 
 def _consolidate_bus_geodata(net):
     """Ensure `net.bus_geodata` exists and contains x,y for buses when possible.
@@ -241,8 +242,8 @@ def _merge_switch_connected_buses(net):
             break
 
 
-def build_network(read_from_file=False):
-    network_dump = "network_dump/network.p"
+def build_network(read_from_file=False, filename=None):
+    network_dump = filename or "network_dump/network.p"
     if read_from_file and exists(network_dump):
         print("Reading network from file")
         return pp.from_pickle(network_dump)
@@ -432,7 +433,6 @@ def build_network(read_from_file=False):
     # Akkumulátor
     pp.create_storage(net, 0, p_mw=0.0, max_e_mwh=0.05,
                       soc_percent=50, min_e_mwh=0.01, max_p_mw=0.03, min_p_mw=-0.03)
-    pp.to_pickle(net, network_dump)
     return net
 
 
@@ -440,11 +440,22 @@ if __name__ == "__main__":
     print("Build network")
     net = build_network(read_from_file=False)
 
+    # --- SZÉTVÁLASZTÁS ---
+    mg = ppt.create_nxgraph(net, respect_switches=True)
+    components = list(nx.connected_components(mg))
+    components = sorted(components, key=len, reverse=True)
+
+    net_A = pp.select_subnet(net, components[0])
+    net_B = pp.select_subnet(net, components[1])
+
     # --- 8. Load flow (power flow)  ---
     # pp.diagnostic(net)
 
-    print("Run loadflow")
-    pp.runpp(net, algorithm='nr')
+    pp.runpp(net_A)
+    plot_loadflow_results(net_A, "A")
+    pp.to_pickle(net_A, "network_dump/network_A.p")
 
-    print("Plot loadflow")
-    plot_loadflow_results(net)
+    pp.runpp(net_B)
+    plot_loadflow_results(net_B, "B")
+    pp.to_pickle(net_B, "network_dump/network_B.p")
+
