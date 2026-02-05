@@ -1,5 +1,6 @@
 import matplotlib as mpl
 import numpy as np
+import pandas as pd
 import pandapower.plotting as plot
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -65,10 +66,10 @@ def visualize_network(net, k=None, iterations=50, figsize=(10, 8)):
     plt.show()
 
 
-def plot_loadflow_results(net, net_name):
+def plot_loadflow_results(net, net_name, show=True, dpi=300):
     # --- 1) buszfeszültség színezés ---
     vm = net.res_bus.vm_pu.values  # p.u.
-    vmin, vmax = 0.95, 1.05
+    vmin, vmax = 0.9, 0.95
     vm_clipped = np.clip(vm, vmin, vmax)
     vm_norm = (vm_clipped - vmin) / (vmax - vmin + 1e-9)
     bus_colors = [plt.cm.viridis(val) for val in vm_norm]
@@ -251,7 +252,199 @@ def plot_loadflow_results(net, net_name):
         cbar_line = fig.colorbar(sm_line, cax=cax_line)
         cbar_line.set_label("Line loading [%]", fontsize=9)
         cbar_line.ax.tick_params(labelsize=9)
-    plt.tight_layout(rect=(0, 0, 0.85, 1))  # leave space on the right for colorbars
-    plt.savefig(f"loadflow_results_{net_name}.png", dpi=300)
-    plt.show()
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout(rect=(0, 0, 0.85, 1))  # leave space on the right for colorbars
+
+    plt.savefig(f"loadflow_results_{net_name}.png", dpi=dpi)
+    if show:
+        plt.show()
     plt.close()
+
+
+def create_subplot_grid(nets_dict, scenario_names, timestamp, timestep_idx, dpi=120):
+    """
+    Create a grid of loadflow results for all scenarios at a given timestep.
+    Includes all visual elements: voltage/loading colors, bus labels, PV/storage markers, and colorbars.
+
+    Parameters:
+        nets_dict: dict mapping scenario name -> pandapower network
+        scenario_names: list of scenario names (keys in nets_dict)
+        timestamp: string timestamp to display (e.g., "14:00")
+        timestep_idx: integer index of the timestep (for filenames)
+        dpi: dots per inch for saved image (100=fast, 150=balanced, 300=high quality)
+
+    Returns:
+        path to the saved grid image, or None if failed
+    """
+    import os
+
+    n_scenarios = len(scenario_names)
+    n_cols = min(3, n_scenarios)  # max 3 columns
+    n_rows = (n_scenarios + n_cols - 1) // n_cols  # ceiling division
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6*n_rows))
+
+    # Flatten axes for easier indexing
+    if n_scenarios == 1:
+        axes_flat = [axes]
+    elif n_rows == 1:
+        axes_flat = axes.flatten()
+    else:
+        axes_flat = axes.flatten()
+
+    # Add overall title with timestamp
+    fig.suptitle(f"Network State at {timestamp}", fontsize=18, fontweight='bold', y=0.98)
+
+    for idx, scen_name in enumerate(scenario_names):
+        ax = axes_flat[idx]
+        net = nets_dict[scen_name]
+
+        # --- Prepare voltage and loading data ---
+        vm = net.res_bus.vm_pu.values  # p.u.
+        vmin, vmax = 0.9, 0.95
+        vm_clipped = np.clip(vm, vmin, vmax)
+        vm_norm = (vm_clipped - vmin) / (vmax - vmin + 1e-9)
+        bus_colors = [plt.cm.viridis(val) for val in vm_norm]
+
+        bus_collection = plot.create_bus_collection(
+            net,
+            buses=net.bus.index.tolist(),
+            size=18,
+            color=bus_colors
+        )
+
+        line_collections = []
+        if len(net.line):
+            loading = net.res_line.loading_percent.values  # %
+            loading_clipped = np.clip(loading, 0, 100)
+            loading_norm = loading_clipped / 100.0
+            line_colors = [plt.cm.inferno(val) for val in loading_norm]
+
+            lc = plot.create_line_collection(
+                net,
+                lines=net.line.index.tolist(),
+                use_bus_geodata=True,
+                color=line_colors,
+                linewidths=2
+            )
+            line_collections.append(lc)
+
+        # --- Draw on subplot ---
+        plot.draw_collections(
+            [bus_collection] + line_collections,
+            ax=ax
+        )
+        ax.set_title(f"Scenario: {scen_name}", fontsize=13, fontweight='bold')
+
+        # --- Add bus labels with voltage values ---
+        pos_map = {}
+
+        # Try net.bus_geodata (usual pandapower location)
+        if hasattr(net, "bus_geodata") and not net.bus_geodata.empty:
+            for bus_idx in net.bus_geodata.index:
+                try:
+                    pos_map[bus_idx] = (net.bus_geodata.at[bus_idx, "x"], net.bus_geodata.at[bus_idx, "y"])
+                except Exception:
+                    continue
+
+        # Try separate 'x' and 'y' columns on net.bus
+        if not pos_map and "x" in net.bus.columns and "y" in net.bus.columns:
+            for bus_idx, row in net.bus.iterrows():
+                xval = row.get("x")
+                yval = row.get("y")
+                if pd.notna(xval) and pd.notna(yval):
+                    pos_map[bus_idx] = (xval, yval)
+
+        # Place bus labels
+        if pos_map:
+            for bus_idx in net.bus.index:
+                if bus_idx not in pos_map:
+                    continue
+                x, y = pos_map[bus_idx]
+                vm_pu = net.res_bus.at[bus_idx, "vm_pu"]
+                label = f"{bus_idx}\n{vm_pu:.3f}pu"
+                ax.text(
+                    x, y + 0.08,
+                    label,
+                    fontsize=5,
+                    ha="center",
+                    va="bottom",
+                )
+
+            # --- Add PV (sgen) markers ---
+            pv_xs, pv_ys = [], []
+            if hasattr(net, "sgen") and len(net.sgen):
+                for _, srow in net.sgen.iterrows():
+                    b = int(srow.get("bus"))
+                    if b in pos_map:
+                        xx, yy = pos_map[b]
+                        pv_xs.append(xx)
+                        pv_ys.append(yy)
+            if pv_xs:
+                ax.scatter(pv_xs, pv_ys, c="lime", marker="^", s=100, edgecolors="k", zorder=6, label="PV (sgen)", linewidths=0.5)
+
+            # --- Add Storage markers ---
+            st_xs, st_ys = [], []
+            if hasattr(net, "storage") and len(net.storage):
+                for _, srow in net.storage.iterrows():
+                    b = int(srow.get("bus"))
+                    if b in pos_map:
+                        xx, yy = pos_map[b]
+                        st_xs.append(xx)
+                        st_ys.append(yy)
+            if st_xs:
+                ax.scatter(st_xs, st_ys, c="orange", marker="s", s=100, edgecolors="k", zorder=6, label="Storage", linewidths=0.5)
+
+            # Add legend if there are markers
+            handles, labels_list = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
+
+        ax.axis('off')  # Hide axis labels
+
+    # Hide any unused subplots
+    for idx in range(n_scenarios, len(axes_flat)):
+        axes_flat[idx].axis('off')
+
+    # --- Add colorbars below the grid ---
+    # Create colorbar axes at the bottom
+    cbar_ax_voltage = fig.add_axes([0.15, 0.05, 0.3, 0.02])
+    cbar_ax_loading = fig.add_axes([0.55, 0.05, 0.3, 0.02])
+
+    # Voltage colorbar
+    sm_bus = mpl.cm.ScalarMappable(
+        cmap=plt.cm.viridis,
+        norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    )
+    sm_bus.set_array([])
+    cbar_bus = fig.colorbar(sm_bus, cax=cbar_ax_voltage, orientation='horizontal')
+    cbar_bus.set_label("Bus voltage [p.u.]", fontsize=10)
+    cbar_bus.ax.tick_params(labelsize=8)
+
+    # Loading colorbar
+    sm_line = mpl.cm.ScalarMappable(
+        cmap=plt.cm.inferno,
+        norm=mpl.colors.Normalize(vmin=0, vmax=100)
+    )
+    sm_line.set_array([])
+    cbar_line = fig.colorbar(sm_line, cax=cbar_ax_loading, orientation='horizontal')
+    cbar_line.set_label("Line loading [%]", fontsize=10)
+    cbar_line.ax.tick_params(labelsize=8)
+
+    # Save the grid figure
+    output_path = f"grid_frames/grid_frame_{timestep_idx:04d}.png"
+    os.makedirs("grid_frames", exist_ok=True)
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        fig.tight_layout(rect=[0, 0.08, 1, 0.96])  # Leave space for colorbars
+
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+
+    return output_path
+

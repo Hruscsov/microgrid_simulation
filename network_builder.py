@@ -7,6 +7,25 @@ from visualization import plot_loadflow_results
 import pandapower.topology as ppt
 import networkx as nx
 
+def battery_voltage_control(net, v_min=0.97, v_max=1.03):
+    if not hasattr(net, "storage") or net.storage.empty:
+        return
+
+    for i, s in net.storage.iterrows():
+        bus = int(s.bus)
+
+        if bus not in net.res_bus.index:
+            continue
+
+        v = net.res_bus.at[bus, "vm_pu"]
+
+        if v > v_max:
+            net.storage.at[i, "p_mw"] = s.max_p_mw   # tölt
+        elif v < v_min:
+            net.storage.at[i, "p_mw"] = s.min_p_mw   # süt
+        else:
+            net.storage.at[i, "p_mw"] = 0.0
+
 def _consolidate_bus_geodata(net):
     """Ensure `net.bus_geodata` exists and contains x,y for buses when possible.
     This function looks for geodata in several places that `create_bus` or the
@@ -430,15 +449,6 @@ def build_network(read_from_file=False, filename=None):
         _merge_switch_connected_buses(net)
     except Exception:
         pass
-    # Akkumulátor
-    pp.create_storage(net, 0, p_mw=0.0, max_e_mwh=0.05,
-                      soc_percent=50, min_e_mwh=0.01, max_p_mw=0.03, min_p_mw=-0.03)
-    return net
-
-
-if __name__ == "__main__":
-    print("Build network")
-    net = build_network(read_from_file=False)
 
     # --- SZÉTVÁLASZTÁS ---
     mg = ppt.create_nxgraph(net, respect_switches=True)
@@ -448,14 +458,89 @@ if __name__ == "__main__":
     net_A = pp.select_subnet(net, components[0])
     net_B = pp.select_subnet(net, components[1])
 
-    # --- 8. Load flow (power flow)  ---
-    # pp.diagnostic(net)
+    # --- AKSIK HOZZÁADÁSA (DINAMIKUSAN) ---
 
-    pp.runpp(net_A)
+    # Find a suitable bus for storage in each subnet
+    # Prefer buses that have loads or sgens (active nodes)
+    def find_suitable_storage_bus(subnet):
+        """Find a good bus to place storage (one with existing loads or sgens)"""
+        candidate_buses = []
+
+        # Buses with loads
+        if len(subnet.load) > 0:
+            candidate_buses.extend(subnet.load['bus'].unique().tolist())
+
+        # Buses with sgens
+        if len(subnet.sgen) > 0:
+            candidate_buses.extend(subnet.sgen['bus'].unique().tolist())
+
+        if candidate_buses:
+            # Pick the first one or one with most connections
+            return candidate_buses[0]
+
+        # Fallback: any bus with voltage > 0
+        valid_buses = subnet.bus[subnet.bus['vn_kv'] > 0].index
+        if len(valid_buses) > 0:
+            return valid_buses[0]
+
+        return None
+
+    bus_A = find_suitable_storage_bus(net_A)
+    bus_B = find_suitable_storage_bus(net_B)
+
+    if bus_A is not None:
+        pp.create_storage(
+            net_A,
+            bus=bus_A,
+            p_mw=0.0,
+            max_e_mwh=0.05,
+            soc_percent=50,
+            min_e_mwh=0.01,
+            max_p_mw=0.03,
+            min_p_mw=-0.03,
+            name="BAT_A"
+        )
+        print(f"Added BAT_A at bus {bus_A} in net_A")
+    else:
+        print("Warning: Could not find suitable bus for BAT_A")
+
+    pp.to_pickle(net_A, "network_dump/net_A.p")
+
+    if bus_B is not None:
+        pp.create_storage(
+            net_B,
+            bus=bus_B,
+            p_mw=0.0,
+            max_e_mwh=0.05,
+            soc_percent=50,
+            min_e_mwh=0.01,
+            max_p_mw=0.03,
+            min_p_mw=-0.03,
+            name="BAT_B"
+        )
+        print(f"Added BAT_B at bus {bus_B} in net_B")
+    else:
+        print("Warning: Could not find suitable bus for BAT_B")
+    pp.to_pickle(net_B, "network_dump/net_B.p")
+    pp.to_pickle(net, network_dump)
+    return net, net_A, net_B
+
+
+
+if __name__ == "__main__":
+    print("Build network")
+    net, net_A, net_B = build_network(read_from_file=False)
+
+    # --- NET A ---
+    pp.runpp(net_A)  # 1. alap állapot
+    battery_voltage_control(net_A)  # 2. aksi dönt
+    pp.runpp(net_A)  # 3. új loadflow
     plot_loadflow_results(net_A, "A")
-    pp.to_pickle(net_A, "network_dump/network_A.p")
 
+    # --- NET B ---
+    pp.runpp(net_B)
+    battery_voltage_control(net_B)
     pp.runpp(net_B)
     plot_loadflow_results(net_B, "B")
-    pp.to_pickle(net_B, "network_dump/network_B.p")
+
 

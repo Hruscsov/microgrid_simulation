@@ -1,3 +1,6 @@
 pandas
 pandapower
 openpyxl
+imageio
+pillow
+imageio-ffmpeg
