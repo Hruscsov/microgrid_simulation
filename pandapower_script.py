@@ -1,247 +1,470 @@
+from os.path import exists
+
 import pandas as pd
+import numpy as np
 import pandapower as pp
 
+from matplotlib import pyplot as plt
+
 from network_builder import build_network
-from visualization import plot_loadflow_results, create_subplot_grid
-import os
+from visualization import create_subplot_grid
 import copy
+import os
+import time
+from PIL import Image, ImageDraw, ImageFont
 
-def add_extra_pvs(net, num_pvs, peak_power_mw=0.01):
-    # Add extra PVs to the network based on the profile
-    pv_buses = net.sgen.bus
-    trafo_buses = net.trafo.hv_bus + net.trafo.lv_bus
-    ext_grid_buses = net.ext_grid.bus
-    candidate_buses = net.bus.index.difference(ext_grid_buses + trafo_buses + pv_buses)  # Buses that are not already connected to ext_grid or trafo
-    for i in range(num_pvs):
-        bus = candidate_buses[i % len(candidate_buses)]
-        pp.create_sgen(net, bus=bus, p_mw=peak_power_mw, name=f"PV_{i}")
-        net.sgen.at[net.sgen.index[-1], "p_mw0"] = peak_power_mw  # Store original power for scaling
+# ==========================
+# KONFIGURÁCIÓ
+# ==========================
+DT = 0.25  # óra (0.25 = 15 perc)
+
+# --- Futási módok ---
+RUN_MODE = "continuous"  # "continuous" vagy "year_daily_window"
+SCENARIO_MODE = "all"   # "all" vagy "original_only"
+
+# continuous módban ez számít (első N időlépést futtatja)
+TIMESTEPS = None
+
+# year_daily_window módban:
+WINDOW_START = "12:00"
+WINDOW_HOURS = 1
+RESET_SOC_EACH_DAY = True
+YEAR_SAVE_EVERY_STEP_IN_WINDOW = False
+
+# Vizualizáció / frame
+FRAME_SAMPLE_RATE = 96
+PLOT_DPI = 80
+NETWORKS = ["A", "B"]
+
+# Fájlok
+LOAD_FILE = "measurements_clean.csv"
+PV_FILE = "Puspokszilagy_meteo_adatsor_2023_with_PV_forecast.csv"
+
+# ========= ÚJ: kapcsolók (nem nyúlunk a logikához, csak ki-be) =========
+SAVE_FRAMES = False     # ha False: nincs create_subplot_grid, nincs képfájl
+MAKE_GIF = False        # ha False: nincs GIF (akkor se, ha vannak frame-ek)
+SAVE_PLOTS = True       # ha False: nem ment matplotlib idősor ábrát
+
+# Progress frissítés (lépésekben)
+PROGRESS_EVERY = 4      # pl. 4 = óránként (15 perces lépésnél), 96 = naponta, 500 = ritkán
+
+# Battery paraméterek
+BATTERY_SIZE_MWH = 0.2  # MWh-ban
+BATTERY_POWER_MW = 0.025
+# ==========================
+# SEGÉDFÜGGVÉNYEK
+# ==========================
+
+def add_pvs(net, num_pvs=10, p_mw=0.005):
+    pv_buses = net.sgen.bus if len(net.sgen) > 0 else []
+    trafo_buses = net.trafo.hv_bus.tolist() + net.trafo.lv_bus.tolist()
+    ext_grid_buses = net.ext_grid.bus.tolist()
+    forbidden = set(ext_grid_buses + trafo_buses + list(pv_buses))
+    candidate_buses = [b for b in net.bus.index if b not in forbidden][:num_pvs]
+
+    for i, bus in enumerate(candidate_buses):
+        idx = pp.create_sgen(net, bus=bus, p_mw=p_mw, name=f"PV_{i}")
+        net.sgen.at[idx, "p_mw0"] = p_mw
 
 
-# ========== OPTIMIZATION SETTINGS ==========
-# MEDIUM VIDEO (36 seconds) - Balanced
-FRAME_SAMPLE_RATE = 4
-FRAME_DURATION = 1.5
-fps_multiplier = 3
+def get_storage_index(net, network_type):
+    if not hasattr(net, "storage") or net.storage.empty:
+        return None
 
-SKIP_INDIVIDUAL_GIFS = False  # Skip creating individual GIFs per scenario (only create grid GIF)
-PLOT_DPI = 100  # Lower DPI = faster plotting (100 = good balance, 300 = high quality but slow)
-CREATE_MP4 = True  # Create MP4 video instead of GIF (better playback control, consistent speed)
-# ==========================================
+    target = f"BAT_{network_type}"
+    if "name" in net.storage.columns:
+        hits = net.storage.index[net.storage["name"].astype(str).str.upper() == target]
+        if len(hits):
+            return int(hits[0])
 
-# 1. Fájlbeolvasás
-# A Fogyasztasi_adatok.csv fájlból jöjjenek a profil adatok
-load_profile = pd.read_csv("load_profile.csv", index_col=0, parse_dates=True)
-# A PV adatok pedig a Puspokszilagy_meteo_adatsor_2023_with_PV_forecast.csv fájlból
-pv_profile = pd.read_csv("Puspokszilagy_meteo_adatsor_2023_with_PV_forecast.csv", index_col=0, parse_dates=True)
+    return int(net.storage.index[0])
 
-# 2. Hálózatmodell
-# NOTE: Network_A has issues loading. Using Network_B instead.
-# If you need Network_A, the issue is in the network_builder.build_network() function
-base_net = build_network(read_from_file=True, filename="network_dump/net_B.p")
-add_extra_pvs(base_net, num_pvs=10, peak_power_mw=0.01)  # Add 10 extra PVs with 10 kW peak power
 
-pp.runpp(base_net)
-plot_loadflow_results(base_net, "base", show=True)
+def stamp_image(img, text):
+    img = img.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
 
-# Storage index for this network (network_B uses 0, network_A uses 1)
-STORAGE_INDEX = 0  # Change to 1 if using network_A
+    bar_h = 34
+    draw.rectangle([0, 0, img.width, bar_h], fill=(0, 0, 0, 180))
 
-# 3. Szimuláció
-dt = 0.25
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except:
+        font = ImageFont.load_default()
 
-# Try to get storage info, but handle errors gracefully
-try:
-    max_p = base_net.storage.loc[STORAGE_INDEX, "max_p_mw"]
-    HAS_STORAGE = True
-    print(f"✓ Storage found at index {STORAGE_INDEX}")
-except Exception as e:
-    print(f"⚠ Storage error: {e}")
-    print(f"⚠ Disabling battery control for this network")
-    max_p = 0
-    HAS_STORAGE = False
+    draw.text((10, 7), text, fill=(255, 255, 255, 255), font=font)
+    out = Image.alpha_composite(img, overlay).convert("RGB")
+    return out
 
-error_types = ["original", "0.05", "0.1", "0.2", "no_control"]
 
-# Storage for all-scenario results for grid plotting
-all_scenario_results = {scen: [] for scen in error_types}
-all_scenario_frames = {scen: [] for scen in error_types}
-all_scenario_nets = {scen: copy.deepcopy(base_net) for scen in error_types}
+def format_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
-# Initialize SOC (only if storage exists)
-all_scenario_soc = {}
-for scen in error_types:
+
+def progress_bar(prefix: str, i: int, n: int, start_ts: float, extra: str = "", width: int = 24):
+    now = time.time()
+    done = i + 1
+    frac = done / n if n else 1.0
+    filled = int(width * frac)
+    bar = "█" * filled + "░" * (width - filled)
+
+    elapsed = now - start_ts
+    rate = elapsed / done if done > 0 else 0
+    eta = rate * (n - done) if done > 0 else 0
+
+    line = (
+        f"\r{prefix} [{bar}] {frac*100:6.2f}%  "
+        f"{done}/{n}  elapsed {format_hms(elapsed)}  ETA {format_hms(eta)}"
+    )
+    if extra:
+        line += f"  | {extra}"
+
+    print(line, end="", flush=True)
+
+    if done == n:
+        print("", flush=True)
+
+
+def make_timestamped_gif(grid_frames, network_type, out_path, duration_ms=500):
+    if not grid_frames:
+        print("  (nincs frame, GIF kihagyva)")
+        return
+
+    grid_frames = sorted(grid_frames, key=lambda x: x[1])
+    images = []
+
+    for path, current_time in grid_frames:
+        if not os.path.exists(path):
+            continue
+
+        time_str = current_time.strftime("%Y-%m-%d %H:%M")
+        img = Image.open(path)
+        img = stamp_image(img, f"Network {network_type} - {time_str}")
+        img.thumbnail((800, 600), Image.Resampling.LANCZOS)
+        images.append(img)
+
+    if not images:
+        print("  (nem találtam képfájlokat, GIF kihagyva)")
+        return
+
+    images[0].save(
+        out_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True
+    )
+
+    print(f"  ✅ GIF mentve: {out_path} ({len(images)} frame)")
+
+
+def parse_hhmm(s: str):
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+def build_sim_positions(load_index: pd.DatetimeIndex):
+    """
+    - continuous: 0..TIMESTEPS-1 (ha TIMESTEPS=None -> teljes fájl)
+    - year_daily_window: minden nap WINDOW_START..(+WINDOW_HOURS) ablak (vagy csak WINDOW_START)
+    """
+    if RUN_MODE == "continuous":
+        if TIMESTEPS is None:
+            return list(range(len(load_index)))
+        else:
+            return list(range(min(TIMESTEPS, len(load_index))))
+
+    if RUN_MODE == "year_daily_window":
+        h0, m0 = parse_hhmm(WINDOW_START)
+        step_minutes = int(DT * 60)
+        steps_in_window = int((WINDOW_HOURS * 60) / step_minutes)
+
+        days = pd.Series(load_index).dt.normalize().unique()
+        pos_map = {ts: i for i, ts in enumerate(load_index)}
+
+        pos_list = []
+        for d in days:
+            start = pd.Timestamp(d) + pd.Timedelta(hours=h0, minutes=m0)
+
+            if YEAR_SAVE_EVERY_STEP_IN_WINDOW:
+                for k in range(steps_in_window):
+                    ts = start + pd.Timedelta(minutes=step_minutes * k)
+                    if ts in pos_map:
+                        pos_list.append(pos_map[ts])
+            else:
+                ts = start
+                if ts in pos_map:
+                    pos_list.append(pos_map[ts])
+
+        return pos_list
+
+    raise ValueError(f"Ismeretlen RUN_MODE: {RUN_MODE}")
+
+
+# ==========================
+# SZIMULÁCIÓ
+# ==========================
+
+def modify_storage(base_net, storage_idx, max_p_mw, max_e_mwh):
+    base_net.storage.at[storage_idx, "max_p_mw"] = max_p_mw
+    base_net.storage.at[storage_idx, "min_p_mw"] = -max_p_mw
+    base_net.storage.at[storage_idx, "max_e_mwh"] = max_e_mwh
+    base_net.storage.at[storage_idx, "min_e_mwh"] = max_e_mwh*0.05
+
+
+def run_simulation(NETWORK_TYPE):
+    print("=" * 60)
+    print(f"SZIMULÁCIÓ - Network_{NETWORK_TYPE} | RUN_MODE={RUN_MODE}")
+    print("=" * 60)
+
+    # LOAD
+    load_df = pd.read_csv(LOAD_FILE, index_col=0, parse_dates=True)
+    load_data = load_df.values
+
+    # PV
+    if not exists(PV_FILE):
+        raise ValueError("PV fájl nem található: " + PV_FILE)
+    pv_profile_df = pd.read_csv(
+        PV_FILE,
+        index_col=0,
+        parse_dates=True
+    )
+    pv_data = pv_profile_df.values
+    pv_cols = {col: i for i, col in enumerate(pv_profile_df.columns)}
+
+    # szimulációs sorpozíciók
+    sim_pos = build_sim_positions(load_df.index)
+    total_steps = len(sim_pos)
+    print(f"Sim lépések: {total_steps} / összes sor: {len(load_df)}")
+
+    if total_steps == 0:
+        print("⚠ Nincs egyetlen kiválasztott timestep sem (ellenőrizd a dátum/indexeket).")
+        return
+
+    # Hálózat
+    base_net = build_network(read_from_file=True, filename=f"network_dump/net_{NETWORK_TYPE}.p")
+    add_pvs(base_net, num_pvs=5, p_mw=0.008)
+
+    # Storage
+    storage_idx = get_storage_index(base_net, NETWORK_TYPE)
+    modify_storage(base_net, storage_idx, max_p_mw=BATTERY_POWER_MW, max_e_mwh=BATTERY_SIZE_MWH)
+    HAS_STORAGE = storage_idx is not None
+
     if HAS_STORAGE:
-        try:
-            all_scenario_soc[scen] = all_scenario_nets[scen].storage.loc[STORAGE_INDEX, "soc_percent"] / 100 * all_scenario_nets[scen].storage.loc[STORAGE_INDEX, "max_e_mwh"]
-        except Exception:
-            all_scenario_soc[scen] = 0
+        max_p = float(base_net.storage.loc[storage_idx, "max_p_mw"])
+        max_e = float(base_net.storage.loc[storage_idx, "max_e_mwh"])
+        base_net.storage.loc[storage_idx, "soc_percent"] = 50.0
+        initial_soc = 0.5 * max_e
+        print(f"Storage: idx={storage_idx}, max_e={max_e:.2f} MWh")
     else:
-        all_scenario_soc[scen] = 0
+        max_p = 0.0
+        max_e = 0.0
+        initial_soc = 0.0
+        print("Nincs storage ebben a hálóban.")
 
-grid_frames = []
-os.makedirs("grid_frames", exist_ok=True)
+    # Szenáriók
+    all_error_types = ["original", "0.05", "0.1", "0.2", "no_control"]
+    if SCENARIO_MODE == "original_only":
+        error_types = ["original"]
+    else:
+        error_types = all_error_types
 
-# Run all scenarios in parallel per timestep
-print(f"Starting simulation (frame sampling: every {FRAME_SAMPLE_RATE} steps)...")
-for t, T in enumerate(load_profile.index):
-    if t % max(1, len(load_profile) // 10) == 0:
-        print(f"Progress: {t}/{len(load_profile)} timesteps")
+    nets = {scen: copy.deepcopy(base_net) for scen in error_types}
+    socs = {scen: initial_soc for scen in error_types}
 
-    # Update all scenarios simultaneously
-    for scen in error_types:
-        net = all_scenario_nets[scen]
-        soc = all_scenario_soc[scen]
-        capacity = net.storage.loc[STORAGE_INDEX, "max_e_mwh"] if HAS_STORAGE else 0
+    # Pre-extract load indices and values for fast access
+    load_indices = list(base_net.load.index)
+    load_count = len(load_indices)
 
-        # Load update
-        for i in net.load.index:
-            net.load.at[i, 'p_mw'] = load_profile.iloc[t, i % len(load_profile.columns)] / 1000 * 4
+    # Pre-extract sgen indices and their p_mw0 values for fast access
+    sgen_indices = list(base_net.sgen.index)
+    sgen_p_mw0 = [float(base_net.sgen.at[idx, "p_mw0"]) for idx in sgen_indices]
 
-        # PV update
-        fictive_production = 0
-        for i in net.sgen.index:
-            net.sgen.at[i, 'p_mw'] = pv_profile.loc[T, f"PV_forecast_kW_original"] * net.sgen.at[i, 'p_mw0'] * 4 * 20
-            if scen != "no_control":
-                fictive_production += pv_profile.loc[T, f"PV_forecast_kW_{scen}"] * net.sgen.at[i, 'p_mw0'] * 4 * 20
+    # Mappák (csak ha tényleg mentünk képet)
+    os.makedirs(f"results_{NETWORK_TYPE}", exist_ok=True)
+    if SAVE_FRAMES:
+        for scen in error_types:
+            os.makedirs(f"frames_{NETWORK_TYPE}_{scen}", exist_ok=True)
+        os.makedirs(f"grid_frames_{NETWORK_TYPE}", exist_ok=True)
 
-        net_demand = net.load.p_mw.sum() - fictive_production
-        production_error = fictive_production - net.sgen.p_mw.sum()
+    results = {scen: [] for scen in error_types}
+    grid_frames = []
 
-        # Battery control (only if storage exists)
-        if HAS_STORAGE and scen != "no_control":
-            try:
-                capacity = net.storage.loc[STORAGE_INDEX, "max_e_mwh"]
+    start_ts = time.time()
+
+    for step, t in enumerate(sim_pos):
+        current_time = load_df.index[t]
+        time_str = current_time.strftime("%Y-%m-%d %H:%M")
+
+        # Éves metszetnél SOC reset
+        if RUN_MODE == "year_daily_window" and RESET_SOC_EACH_DAY:
+            if current_time.strftime("%H:%M") == WINDOW_START:
+                for scen in socs:
+                    socs[scen] = initial_soc
+
+        row = load_data[t, :]
+
+        base_pv = float(pv_data[t, pv_cols["PV_forecast_kW_original"]])
+
+        for scen in error_types:
+            net = nets[scen]
+            soc = socs[scen]
+
+            # LOAD (ITT MARAD A *4, ahogy nálad működik!)
+            for i, load_idx in enumerate(load_indices):
+                net.load.at[load_idx, "p_mw"] = (row[i] / 1000.0 * 4) if i < load_count else 0.0
+
+            # PV
+            fictive = 0.0
+            for i, sgen_idx in enumerate(sgen_indices):
+                pv_val = base_pv * sgen_p_mw0[i]
+                net.sgen.at[sgen_idx, "p_mw"] = pv_val
+
+                if scen != "no_control":
+                    error_pv = float(pv_data[t, pv_cols[f"PV_forecast_kW_{scen}"]])
+                    fictive += error_pv * sgen_p_mw0[i]
+
+            # BATTERY
+            battery_p = 0.0
+            if HAS_STORAGE and scen != "no_control":
+                net_demand = float(net.load.p_mw.sum()) - fictive
+
                 if net_demand > 0:
-                    discharge = min(net_demand, soc / dt, max_p)
-                    soc -= discharge * dt
-                    net.storage.at[STORAGE_INDEX, 'p_mw'] = discharge
+                    discharge = min(net_demand, soc / DT, max_p)
+                    soc -= discharge * DT
+                    battery_p = discharge
                 else:
-                    charge = min(-net_demand, (capacity - soc) / dt, max_p)
-                    soc += charge * dt
-                    net.storage.at[STORAGE_INDEX, 'p_mw'] = -charge
-            except Exception:
-                pass  # Storage operations failed, skip battery control
+                    charge = min(-net_demand, (max_e - soc) / DT, max_p)
+                    soc += charge * DT
+                    battery_p = -charge
 
-        all_scenario_soc[scen] = soc
+                net.storage.at[storage_idx, "p_mw"] = battery_p
 
-        # Run loadflow
-        pp.runpp(net)
+            socs[scen] = soc
 
-        # Store results
-        try:
-            battery_p = net.storage.at[STORAGE_INDEX, 'p_mw'] if HAS_STORAGE else 0
-        except Exception:
-            battery_p = 0
-
-        result = {
-            "time": load_profile.index[t],
-            "soc": soc,
-            "load_total": net.load.p_mw.sum(),
-            "pv_total": -net.sgen.p_mw.sum(),
-            "battery_p_mw": battery_p,
-            "grid_p_mw": net.res_ext_grid.p_mw.iloc[0],
-            "production_error": production_error,
-            "fictive_pv_production": fictive_production,
-            "net_demand": net_demand
-        }
-        all_scenario_results[scen].append(result)
-
-        # Save individual frames (sampled)
-        if t % FRAME_SAMPLE_RATE == 0:
-            frame_name = f"loadflow_results_{scen}_{t}.png"
-            plot_loadflow_results(net, f"{scen}_{t}", show=False, dpi=PLOT_DPI)
-            frames_dir = f"frames_{scen}"
-            os.makedirs(frames_dir, exist_ok=True)
-            if os.path.exists(frame_name):
-                dst = os.path.join(frames_dir, frame_name)
-                os.replace(frame_name, dst)
-                all_scenario_frames[scen].append(dst)
-
-    # Create grid frame (sampled)
-    if t % FRAME_SAMPLE_RATE == 0:
-        timestamp = load_profile.index[t].strftime("%H:00")
-        nets_at_t = {scen: all_scenario_nets[scen] for scen in error_types}
-        grid_path = create_subplot_grid(nets_at_t, error_types, timestamp, t, dpi=PLOT_DPI)
-        if grid_path:
-            grid_frames.append(grid_path)
-
-
-print("\n--- Simulation complete ---")
-print(f"Created {len(grid_frames)} grid frames (sampled at rate {FRAME_SAMPLE_RATE})")
-
-# Save per-scenario CSVs and plots (fast - no plotting delay)
-print("\n--- Saving per-scenario data ---")
-for scen in error_types:
-    df = pd.DataFrame(all_scenario_results[scen]).set_index("time")
-    df.to_csv(f"simulation_results_{scen}.csv")
-    print(f"Saved simulation_results_{scen}.csv")
-
-# Create per-scenario GIFs only if requested (can skip to save time)
-if not SKIP_INDIVIDUAL_GIFS and all_scenario_frames:
-    print("\n--- Creating per-scenario GIFs ---")
-    for scen in error_types:
-        frames = all_scenario_frames[scen]
-        if frames:
+            # Power flow (NEM BÁNTJUK!)
             try:
-                import imageio.v2 as imageio
-                images = [imageio.imread(p) for p in frames]
-                imageio.mimsave(f"simulation_animation_{scen}.gif", images, duration=FRAME_DURATION)
-                print(f"Saved animation simulation_animation_{scen}.gif with {len(frames)} frames.")
+                pp.runpp(net, numba=True)
+                grid_p = float(net.res_ext_grid.p_mw.iloc[0])
             except Exception:
+                print(f"Couldn't run powerflow for {time_str}")
+                grid_p = 0.0
+
+            results[scen].append({
+                "time": time_str,
+                "load_mw": float(net.load.p_mw.sum()),
+                "pv_mw": float(net.sgen.p_mw.sum()),
+                "battery_mw": float(battery_p),
+                "grid_mw": float(grid_p),
+                "soc_mwh": float(soc),
+            })
+
+        # ====== FRAME MENTÉS (csak ha SAVE_FRAMES=True) ======
+        if SAVE_FRAMES:
+            if RUN_MODE == "continuous":
+                save_frame_now = (t % FRAME_SAMPLE_RATE == 0)
+            else:
+                save_frame_now = True
+
+            if save_frame_now:
                 try:
-                    from PIL import Image
-                    imgs = [Image.open(p).convert('RGBA') for p in frames]
-                    if imgs:
-                        imgs[0].save(f"simulation_animation_{scen}.gif", save_all=True, append_images=imgs[1:], duration=int(FRAME_DURATION * 1000), loop=0)
-                        print(f"Saved animation simulation_animation_{scen}.gif with {len(frames)} frames (Pillow fallback).")
+                    nets_at_t = {scen: nets[scen] for scen in error_types}
+                    saved_path = create_subplot_grid(
+                        nets_at_t,
+                        error_types,
+                        f"{NETWORK_TYPE} {time_str}",
+                        t,
+                        dpi=PLOT_DPI
+                    )
+
+                    if saved_path and os.path.exists(saved_path):
+                        safe_name = current_time.strftime("%Y-%m-%d_%H-%M")
+                        new_name = f"grid_frames_{NETWORK_TYPE}/{safe_name}.png"
+                        os.replace(saved_path, new_name)
+                        grid_frames.append((new_name, current_time))
+
                 except Exception as e:
-                    print(f"Failed to create animation for {scen}:", e)
+                    print(f"\nGrid hiba: {e}")
 
-# Create grid GIF animation
-if grid_frames:
-    print(f"\n--- Creating combined grid animation with {len(grid_frames)} frames ---")
-    try:
-        import imageio.v2 as imageio
-        images = [imageio.imread(p) for p in grid_frames]
-        imageio.mimsave("simulation_animation_grid.gif", images, duration=FRAME_DURATION)
-        print("✓ Saved animation simulation_animation_grid.gif")
-    except Exception:
-        try:
-            from PIL import Image
-            imgs = [Image.open(p).convert('RGBA') for p in grid_frames]
-            if imgs:
-                imgs[0].save("simulation_animation_grid.gif", save_all=True, append_images=imgs[1:], duration=int(FRAME_DURATION * 1000), loop=0)
-                print("✓ Saved animation simulation_animation_grid.gif (Pillow fallback)")
-        except Exception as e:
-            print("Failed to create grid animation:", e)
-else:
-    print("No grid frames created!")
+        # progress (konfig alapján)
+        do_print = (step % PROGRESS_EVERY == 0) or (step == total_steps - 1)
+        if do_print:
+            extra = f"time={time_str}"
+            if SAVE_FRAMES:
+                extra += f" frames={len(grid_frames)}"
+            progress_bar(f"[{NETWORK_TYPE}]", step, total_steps, start_ts, extra=extra, width=28)
 
-print("\n========== SIMULATION SUMMARY ==========")
-print(f"Total timesteps: {len(load_profile)}")
-print(f"Sampled frames (1/{FRAME_SAMPLE_RATE}): {len(grid_frames)}")
-print(f"Output GIF frames: {len(grid_frames)}")
-print(f"Frame sampling rate: {FRAME_SAMPLE_RATE}")
-print(f"Plot DPI: {PLOT_DPI}")
-print(f"Individual GIFs: {'Yes' if not SKIP_INDIVIDUAL_GIFS else 'No'}")
-print("========================================")
+    # CSV + battery metrics + plotok
+    battery_metrics = pd.DataFrame(columns=error_types,
+                                   index=["throughput", "fec", "round_trip_efficiency", "standby_share",
+                                          "grid_exchange", "self_consumption", "self_sufficiency"])
 
-# Create MP4 video (better playback control than GIF)
-if CREATE_MP4 and grid_frames:
-    print(f"\n--- Creating MP4 video (more reliable playback) ---")
-    try:
-        import imageio.v2 as imageio
-        # Calculate FPS: multiply by fps_multiplier for faster playback
-        fps = fps_multiplier / FRAME_DURATION
-        images = [imageio.imread(p) for p in grid_frames]
-        imageio.mimsave("simulation_animation_grid.mp4", images, fps=fps)
-        print(f"✓ Saved video simulation_animation_grid.mp4")
-        print(f"  FPS: {fps:.2f} (playback speed: {fps_multiplier}x)")
-        print(f"  Total duration: {len(grid_frames) * FRAME_DURATION / fps_multiplier:.1f} seconds")
-    except Exception as e:
-        print(f"Could not create MP4 (ffmpeg may not be installed): {e}")
-        print("  Using GIF instead...")
+    for scen in error_types:
+        df = pd.DataFrame(results[scen])
+        df.to_csv(f"results_{NETWORK_TYPE}/results_{scen}_bess_{BATTERY_SIZE_MWH}.csv", index=False)
+
+        battery_metrics.loc["throughput", scen] = df["battery_mw"].abs().sum() * DT
+        battery_metrics.loc["fec", scen] = (
+            (battery_metrics.loc["throughput", scen] / nets[scen].storage.at[storage_idx, "max_e_mwh"])
+            if HAS_STORAGE else 0.0
+        )
+        battery_metrics.loc["round_trip_efficiency", scen] = (
+            ((df[df["battery_mw"] < 0]["battery_mw"].abs().sum() * DT) /
+             (df[df["battery_mw"] > 0]["battery_mw"].sum() * DT))
+            if HAS_STORAGE and (df["battery_mw"] > 0).sum() > 0 else 0.0
+        )
+        battery_metrics.loc["standby_share", scen] = (
+            (df[df["battery_mw"] == 0].shape[0] / df.shape[0])
+            if HAS_STORAGE else 1.0
+        )
+        battery_metrics.loc["grid_exchange", scen] = df["grid_mw"].abs().sum() * DT
+
+        pv_sum = df["pv_mw"].sum()
+        battery_metrics.loc["self_consumption", scen] = (
+            np.minimum(df["pv_mw"], df["load_mw"] + df["battery_mw"].clip(upper=0).abs()).sum() / pv_sum
+            if pv_sum > 0 else 0.0
+        )
+
+        load_sum = df["load_mw"].sum()
+        battery_metrics.loc["self_sufficiency", scen] = (
+            np.minimum(df["pv_mw"]+ df["battery_mw"].clip(lower=0), df["load_mw"]).sum() / load_sum
+            if load_sum > 0 else 0.0
+        )
+
+        if SAVE_PLOTS:
+            df.plot(subplots=True, figsize=(10, 8))
+            plt.tight_layout()
+            plt.savefig(f"results_{NETWORK_TYPE}/simulation_results_{scen}_bess_{BATTERY_SIZE_MWH}.png")
+            plt.close("all")
+
+    battery_metrics.to_csv(f"results_{NETWORK_TYPE}/battery_metrics_bess_{BATTERY_SIZE_MWH}.csv")
+
+    # GIF (csak ha kell és van frame)
+    if SAVE_FRAMES and MAKE_GIF:
+        make_timestamped_gif(
+            grid_frames,
+            NETWORK_TYPE,
+            f"results_{NETWORK_TYPE}/animation_grid.gif"
+        )
+
+    print(f"\n✅ Network_{NETWORK_TYPE} kész!\n")
 
 
+# ==========================
+# FUTTATÁS
+# ==========================
+if __name__ == "__main__":
+    for net_type in NETWORKS:
+        run_simulation(net_type)
 
+    print("=" * 60)
+    print("MINDKÉT HÁLÓZAT LEFUTOTT ✔")
+    print("=" * 60)

@@ -17,7 +17,7 @@ for i, row in df.iterrows():
         error = true_value * np.random.laplace(scale=s)
         df.loc[i, f"PV_forecast_kW_{s}"] = true_value + error
 
-df.to_csv("Puspokszilagy_meteo_adatsor_2023_with_PV_forecast.csv")
+df.rename(columns={"PV_Output_kW": "PV_forecast_kW_original"}).to_csv("Puspokszilagy_meteo_adatsor_2023_with_PV_forecast.csv")
 df.loc["2023-05-16"].plot(y=["PV_Output_kW", "PV_forecast_kW_0.05", "PV_forecast_kW_0.1", "PV_forecast_kW_0.2"],
                           title="PV output and forecasts on 2023-05-16")
 plt.savefig("pv_forecast_error_timeseries.png")

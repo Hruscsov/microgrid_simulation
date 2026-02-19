@@ -265,7 +265,9 @@ def build_network(read_from_file=False, filename=None):
     network_dump = filename or "network_dump/network.p"
     if read_from_file and exists(network_dump):
         print("Reading network from file")
-        return pp.from_pickle(network_dump)
+        net = pp.from_pickle(network_dump)
+        net.sgen["p_mw0"] = net.sgen["p_mw"]
+        return net
 
     # --- 1. Adatok beolvasása ---
     file_path = r"Berkenye_modell.xlsx"

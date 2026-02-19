@@ -69,7 +69,7 @@ def visualize_network(net, k=None, iterations=50, figsize=(10, 8)):
 def plot_loadflow_results(net, net_name, show=True, dpi=300):
     # --- 1) buszfeszültség színezés ---
     vm = net.res_bus.vm_pu.values  # p.u.
-    vmin, vmax = 0.9, 0.95
+    vmin, vmax = 0.9, 1.005
     vm_clipped = np.clip(vm, vmin, vmax)
     vm_norm = (vm_clipped - vmin) / (vmax - vmin + 1e-9)
     bus_colors = [plt.cm.viridis(val) for val in vm_norm]
@@ -244,7 +244,7 @@ def plot_loadflow_results(net, net_name, show=True, dpi=300):
     if len(net.line):
         sm_line = mpl.cm.ScalarMappable(
             cmap=plt.cm.inferno,
-            norm=mpl.colors.Normalize(vmin=0, vmax=100)
+            norm=mpl.colors.Normalize(vmin=0, vmax=12)
         )
         sm_line.set_array([])
         # second colorbar placed to the right of the first one
@@ -304,7 +304,7 @@ def create_subplot_grid(nets_dict, scenario_names, timestamp, timestep_idx, dpi=
 
         # --- Prepare voltage and loading data ---
         vm = net.res_bus.vm_pu.values  # p.u.
-        vmin, vmax = 0.9, 0.95
+        vmin, vmax = 0.9, 1.05
         vm_clipped = np.clip(vm, vmin, vmax)
         vm_norm = (vm_clipped - vmin) / (vmax - vmin + 1e-9)
         bus_colors = [plt.cm.viridis(val) for val in vm_norm]
@@ -427,7 +427,7 @@ def create_subplot_grid(nets_dict, scenario_names, timestamp, timestep_idx, dpi=
     # Loading colorbar
     sm_line = mpl.cm.ScalarMappable(
         cmap=plt.cm.inferno,
-        norm=mpl.colors.Normalize(vmin=0, vmax=100)
+        norm=mpl.colors.Normalize(vmin=0, vmax=12)
     )
     sm_line.set_array([])
     cbar_line = fig.colorbar(sm_line, cax=cbar_ax_loading, orientation='horizontal')
